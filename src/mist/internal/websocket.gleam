@@ -47,11 +47,11 @@ pub type WebsocketState(state) {
   )
 }
 
-/// The most a connection may have waiting for the rest of a frame. A frame says how long it is in
+/// The most a connection may have waiting (64 KB) for the rest of a frame. A frame says how long it is in
 /// its header and its payload arrives behind it; without a limit, a peer that announces a huge frame
 /// and keeps sending makes the buffer grow until the node runs out of memory. Past this, the
 /// connection is closed.
-const max_buffered_bytes = 1_048_576
+const max_buffered_bytes = 65_536
 
 pub type Handler(state, message) =
   fn(state, HandlerMessage(message), WebsocketConnection) ->
