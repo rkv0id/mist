@@ -1,6 +1,7 @@
 import gleam/bytes_tree
 import gleam/erlang/process.{type Selector, type Subject}
 import gleam/http/response
+import gleam/int
 import gleam/option.{type Option, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
@@ -130,6 +131,23 @@ pub fn with_func(
               logging.log(logging.Warning, msg)
               let _ =
                 response.new(400)
+                |> response.prepend_header("connection", "close")
+                |> response.set_body(bytes_tree.new())
+                |> encoder.to_bytes_tree("1.1")
+                |> transport.send(conn.transport, conn.socket, _)
+              Ok(Nil)
+            }
+            http.HeadTooLarge -> {
+              logging.log(
+                logging.Warning,
+                "A request's line and headers went past "
+                  <> int.to_string(http.max_head_bytes)
+                  <> " bytes or "
+                  <> int.to_string(http.max_header_count)
+                  <> " headers; answered 431 and closed",
+              )
+              let _ =
+                response.new(431)
                 |> response.prepend_header("connection", "close")
                 |> response.set_body(bytes_tree.new())
                 |> encoder.to_bytes_tree("1.1")

@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/bool
 import gleam/bytes_tree.{type BytesTree}
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
@@ -72,7 +73,20 @@ pub type DecodedPacket {
   Http2Upgrade(BitArray)
 }
 
+/// The most a request's first line and headers may take together (64 KB),
+/// and the most header lines it may carry. Headers arrive before anything
+/// can be checked, so without a limit a peer that sends one endless header
+/// line, or a hundred thousand short ones, makes the connection's buffer
+/// grow until the node runs out of memory. Past either, the request is
+/// answered 431 and the connection closed.
+pub const max_head_bytes = 65_536
+
+pub const max_header_count = 100
+
 pub type DecodeError {
+  /// The request line and headers went past `max_head_bytes` or
+  /// `max_header_count`.
+  HeadTooLarge
   MalformedRequest
   InvalidMethod
   InvalidPath
@@ -91,31 +105,49 @@ pub fn from_header(value: BitArray) -> String {
   string.lowercase(value)
 }
 
+/// Parses header lines until the blank line. `budget` is what is left of
+/// `max_head_bytes` after the request line; `count` is the header lines
+/// parsed so far.
 pub fn parse_headers(
   bs: BitArray,
   socket: Socket,
   transport: Transport,
   headers: Dict(String, String),
+  budget: Int,
+  count: Int,
 ) -> Result(#(Dict(String, String), BitArray), DecodeError) {
   case decode_packet(HttphBin, bs, []) {
     Ok(BinaryData(HttpHeader(_, _field, field, value), rest)) -> {
-      let field = from_header(field)
-      let assert Ok(value) = bit_array.to_string(value)
-      headers
-      |> dict.insert(field, value)
-      |> parse_headers(rest, socket, transport, _)
+      let budget =
+        budget - { bit_array.byte_size(bs) - bit_array.byte_size(rest) }
+      let count = count + 1
+      case budget < 0 || count > max_header_count {
+        True -> Error(HeadTooLarge)
+        False -> {
+          let field = from_header(field)
+          let assert Ok(value) = bit_array.to_string(value)
+          headers
+          |> dict.insert(field, value)
+          |> parse_headers(rest, socket, transport, _, budget, count)
+        }
+      }
     }
     Ok(EndOfHeaders(rest)) -> Ok(#(headers, rest))
-    Ok(MoreData(size)) -> {
-      let amount_to_read = option.unwrap(size, 0)
-      use next <- result.try(read_data(
-        socket,
-        transport,
-        Buffer(amount_to_read, bs),
-        UnknownHeader,
-      ))
-      parse_headers(next, socket, transport, headers)
-    }
+    Ok(MoreData(_)) if budget < 0 -> Error(HeadTooLarge)
+    Ok(MoreData(size)) ->
+      case bit_array.byte_size(bs) > budget {
+        True -> Error(HeadTooLarge)
+        False -> {
+          let amount_to_read = option.unwrap(size, 0)
+          use next <- result.try(read_data(
+            socket,
+            transport,
+            Buffer(amount_to_read, bs),
+            UnknownHeader,
+          ))
+          parse_headers(next, socket, transport, headers, budget, count)
+        }
+      }
     _other -> Error(UnknownHeader)
   }
 }
@@ -300,11 +332,16 @@ pub fn parse_request(
         |> decode_http_method
         |> result.replace_error(UnknownMethod),
       )
+      let budget =
+        max_head_bytes - { bit_array.byte_size(bs) - bit_array.byte_size(rest) }
+      use <- bool.guard(budget < 0, Error(HeadTooLarge))
       use #(headers, rest) <- result.try(parse_headers(
         rest,
         conn.socket,
         conn.transport,
         dict.new(),
+        budget,
+        0,
       ))
       use path <- result.try(
         path
@@ -368,16 +405,20 @@ pub fn parse_request(
     >>)) -> {
       Ok(Upgrade(data))
     }
-    Ok(MoreData(size)) -> {
-      let amount_to_read = option.unwrap(size, 0)
-      use next <- result.try(read_data(
-        conn.socket,
-        conn.transport,
-        Buffer(amount_to_read, bs),
-        MalformedRequest,
-      ))
-      parse_request(next, conn)
-    }
+    Ok(MoreData(size)) ->
+      case bit_array.byte_size(bs) > max_head_bytes {
+        True -> Error(HeadTooLarge)
+        False -> {
+          let amount_to_read = option.unwrap(size, 0)
+          use next <- result.try(read_data(
+            conn.socket,
+            conn.transport,
+            Buffer(amount_to_read, bs),
+            MalformedRequest,
+          ))
+          parse_request(next, conn)
+        }
+      }
     _ -> Error(DiscardPacket)
   }
 }

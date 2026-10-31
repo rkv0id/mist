@@ -3,9 +3,12 @@ import gleam/bytes_tree.{type BytesTree}
 import gleam/http
 import gleam/http/request
 import gleam/http/response.{type Response, Response}
+import gleam/int
 import gleam/option.{Some}
 import gleam/string
 import gleam/uri
+import mist
+import mist/internal/http as mhttp
 import scaffold.{
   bitstring_response_should_equal, make_request, string_response_should_equal,
 }
@@ -237,4 +240,98 @@ pub fn it_sends_back_chunked_responses_test() {
 
   assert resp.status == 200
   assert resp.body == string.repeat("a", 1000)
+}
+
+// --- the head limit -------------------------------------------------------------
+
+@external(erlang, "raw_ffi", "exchange")
+fn exchange(port: Int, head: BitArray, filler: Int) -> #(Int, BitArray)
+
+fn ok_handler(
+  _req: request.Request(mhttp.Connection),
+) -> response.Response(mist.ResponseData) {
+  response.new(200)
+  |> response.set_body(mist.Bytes(bytes_tree.from_string("ok")))
+}
+
+fn status_of(received: BitArray) -> String {
+  case bit_array.to_string(received) {
+    Ok(text) -> string.slice(text, 0, 12)
+    Error(_) -> ""
+  }
+}
+
+fn headers(n: Int) -> String {
+  case n {
+    0 -> ""
+    _ -> headers(n - 1) <> "x-h" <> int.to_string(n) <> ": v\r\n"
+  }
+}
+
+pub fn a_hundred_headers_are_fine_test() {
+  let head = "GET / HTTP/1.1\r\nhost: localhost\r\n" <> headers(99) <> "\r\n"
+  let #(_, received) = {
+    use <- scaffold.open_server(8888, ok_handler)
+    exchange(8888, <<head:utf8>>, 0)
+  }
+  assert status_of(received) == "HTTP/1.1 200"
+}
+
+pub fn a_hundred_and_one_headers_are_refused_test() {
+  let head = "GET / HTTP/1.1\r\nhost: localhost\r\n" <> headers(100) <> "\r\n"
+  let #(_, received) = {
+    use <- scaffold.open_server(8888, ok_handler)
+    exchange(8888, <<head:utf8>>, 0)
+  }
+  assert status_of(received) == "HTTP/1.1 431"
+}
+
+pub fn a_large_header_under_the_limit_is_fine_test() {
+  let head =
+    "GET / HTTP/1.1\r\nhost: localhost\r\ncookie: "
+    <> string.repeat("a", 60_000)
+    <> "\r\n\r\n"
+  let #(_, received) = {
+    use <- scaffold.open_server(8888, ok_handler)
+    exchange(8888, <<head:utf8>>, 0)
+  }
+  assert status_of(received) == "HTTP/1.1 200"
+}
+
+pub fn a_header_past_the_limit_is_refused_test() {
+  let head =
+    "GET / HTTP/1.1\r\nhost: localhost\r\ncookie: "
+    <> string.repeat("a", 70_000)
+    <> "\r\n\r\n"
+  let #(_, received) = {
+    use <- scaffold.open_server(8888, ok_handler)
+    exchange(8888, <<head:utf8>>, 0)
+  }
+  // Either the 431 arrives, or the reset that closing on unread bytes
+  // causes beats it; the handler's 200 never does.
+  let status = status_of(received)
+  assert status == "HTTP/1.1 431" || status == ""
+}
+
+pub fn an_endless_header_line_is_cut_off_test() {
+  // 50 MB of one header line: the server stops reading long before.
+  let #(sent, received) = {
+    use <- scaffold.open_server(8888, ok_handler)
+    exchange(
+      8888,
+      <<"GET / HTTP/1.1\r\nhost: localhost\r\nx-big: ":utf8>>,
+      50_000_000,
+    )
+  }
+  assert sent < 50_000_000
+  assert status_of(received) != "HTTP/1.1 200"
+}
+
+pub fn an_endless_request_line_is_cut_off_test() {
+  let #(sent, received) = {
+    use <- scaffold.open_server(8888, ok_handler)
+    exchange(8888, <<"GET /":utf8>>, 50_000_000)
+  }
+  assert sent < 50_000_000
+  assert status_of(received) != "HTTP/1.1 200"
 }
